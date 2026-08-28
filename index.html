@@ -1297,6 +1297,15 @@
   var GITHUB_BRANCH = "main";
   var GITHUB_FILE_PATH = "exp.xlsx";
   var GITHUB_PAT_KEY = "budgetTrackerGithubPat";
+  var GITHUB_SYNCED_SHA_KEY = "budgetTrackerGithubSyncedSha";
+
+  function getStoredSyncedSha(){
+    try{ return localStorage.getItem(GITHUB_SYNCED_SHA_KEY) || null; }catch(e){ return null; }
+  }
+
+  function setStoredSyncedSha(sha){
+    try{ localStorage.setItem(GITHUB_SYNCED_SHA_KEY, sha); }catch(e){}
+  }
 
   function getStoredGithubToken(){
     try{ return localStorage.getItem(GITHUB_PAT_KEY) || null; }catch(e){ return null; }
@@ -1329,6 +1338,13 @@
       binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
     }
     return btoa(binary);
+  }
+
+  function base64ToUint8Array(base64){
+    var binary = atob(base64.replace(/\n/g, ""));
+    var bytes = new Uint8Array(binary.length);
+    for(var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
   }
 
   async function githubContentsRequest(method, token, body){
@@ -1366,6 +1382,8 @@
       var errBody = await putRes.json().catch(function(){ return {}; });
       throw new Error("שמירה ל-GitHub נכשלה (שגיאה " + putRes.status + "): " + (errBody.message || ""));
     }
+    var putResult = await putRes.json();
+    if(putResult && putResult.content && putResult.content.sha) setStoredSyncedSha(putResult.content.sha);
     setFileStatus("נשמר ל-GitHub (" + GITHUB_FILE_PATH + ")", true);
   }
 
@@ -3112,28 +3130,50 @@
   loadBackground();
   refreshComputed();
 
-  /* ---------- cloud fallback: pull exp.xlsx bundled next to this page ----------
-     Only runs on a browser/device with no saved data yet (nothing in
-     localStorage), so it never overwrites a device that already has its own
-     edits — it just seeds first-time visits (e.g. opening the GitHub Pages
-     site on a new device) with the copy of exp.xlsx committed to the repo. */
-  async function initCloudFallback(){
+  /* ---------- sync with GitHub on every load ----------
+     localStorage is per-browser, so a save made in another session/device
+     never reaches this one on its own. On every load we check the repo's
+     current exp.xlsx sha against the sha we last synced: if it moved (another
+     session saved) and we have no unsaved local edits, pull the newer copy
+     down; if we DO have unsaved edits, don't clobber them silently. */
+  async function syncWithGithub(){
     var hasLocalData = false;
     try{ hasLocalData = !!(localStorage.getItem(STORE_KEY) || localStorage.getItem(STORE_KEY_V1)); }catch(e){}
-    if(hasLocalData) return;
     try{
-      var res = await fetch("exp.xlsx");
-      if(!res.ok) return;
-      var buf = await res.arrayBuffer();
-      var wb = XLSX.read(buf, {type:"array"});
-      importWorkbookIntoState(wb, "exp.xlsx");
-      setFileStatus("נטען מהענן (exp.xlsx) — שמירה תעדכן את אותו קובץ ב-GitHub", false);
+      var res = await fetch("https://api.github.com/repos/" + GITHUB_OWNER + "/" + GITHUB_REPO + "/contents/" + GITHUB_FILE_PATH + "?ref=" + GITHUB_BRANCH,
+        { headers: { "Accept": "application/vnd.github+json" } });
+      if(!res.ok) throw new Error("github contents fetch failed: " + res.status);
+      var meta = await res.json();
+      var storedSha = getStoredSyncedSha();
+
+      if(hasLocalData && storedSha === meta.sha) return; // already up to date
+      if(hasLocalData && isDirty){
+        setFileStatus("קיימת גרסה חדשה יותר ב-GitHub — שמרו את השינויים הנוכחיים לפני שהם יוחלפו", false);
+        return;
+      }
+
+      var wb = XLSX.read(base64ToUint8Array(meta.content), {type:"array"});
+      importWorkbookIntoState(wb, GITHUB_FILE_PATH);
+      setStoredSyncedSha(meta.sha);
+      setFileStatus(hasLocalData
+        ? "עודכן מ-GitHub לגרסה האחרונה (נשמרה בסשן אחר)"
+        : "נטען מ-GitHub — שמירה תעדכן את אותו קובץ", true);
     }catch(e){
-      // no bundled file reachable (e.g. local file:// page, or none uploaded yet) — keep blank state
+      if(hasLocalData) return; // keep whatever's local; GitHub just wasn't reachable
+      try{
+        var fallbackRes = await fetch("exp.xlsx");
+        if(!fallbackRes.ok) return;
+        var buf = await fallbackRes.arrayBuffer();
+        var fallbackWb = XLSX.read(buf, {type:"array"});
+        importWorkbookIntoState(fallbackWb, "exp.xlsx");
+        setFileStatus("נטען מהעותק המקומי בדף — לא ניתן היה להתחבר ל-GitHub", false);
+      }catch(e2){
+        // no bundled file reachable either (e.g. local file:// page) — keep blank state
+      }
     }
   }
 
-  initCloudFallback();
+  syncWithGithub();
 })();
 </script>
 </body>
