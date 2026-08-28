@@ -1002,6 +1002,7 @@
         </div>
         <button class="primary" id="btnAddExpense" type="button">+ הוסף הוצאה</button>
         <button class="ghost" id="btnManageCategories" type="button">ניהול קטגוריות</button>
+        <button class="ghost" id="btnOpenExcelFile" type="button" hidden>פתח קובץ</button>
         <button class="ghost" id="btnSaveExcel" type="button">שמור ל-Excel</button>
       </div>
     </div>
@@ -1284,8 +1285,57 @@
   var xlsxWorkbook = null;   // parsed SheetJS workbook, once a file has been opened
   var xlsxSheetName = null;
   var xlsxFileName = null;
+  var xlsxFileHandle = null; // FileSystemFileHandle for the linked local file, when connected
+  var SUPPORTS_FSA = typeof window.showSaveFilePicker === "function" && typeof window.showOpenFilePicker === "function";
 
   var CONFIG_SHEET_NAME = "__budget_config";
+
+  /* ---------- persist the linked FileSystemFileHandle across reloads ----------
+     FileSystemFileHandle is structured-cloneable, so IndexedDB can store it
+     directly (localStorage cannot hold non-JSON values). */
+  var IDB_DB_NAME = "budgetTrackerFileHandles";
+  var IDB_STORE_NAME = "handles";
+  var IDB_HANDLE_KEY = "xlsxFileHandle";
+
+  function idbOpen(){
+    return new Promise(function(resolve, reject){
+      var req = indexedDB.open(IDB_DB_NAME, 1);
+      req.onupgradeneeded = function(){ req.result.createObjectStore(IDB_STORE_NAME); };
+      req.onsuccess = function(){ resolve(req.result); };
+      req.onerror = function(){ reject(req.error); };
+    });
+  }
+
+  async function idbSetHandle(handle){
+    try{
+      var db = await idbOpen();
+      await new Promise(function(resolve, reject){
+        var tx = db.transaction(IDB_STORE_NAME, "readwrite");
+        tx.objectStore(IDB_STORE_NAME).put(handle, IDB_HANDLE_KEY);
+        tx.oncomplete = resolve;
+        tx.onerror = function(){ reject(tx.error); };
+      });
+    }catch(e){}
+  }
+
+  async function idbGetHandle(){
+    try{
+      var db = await idbOpen();
+      return await new Promise(function(resolve, reject){
+        var tx = db.transaction(IDB_STORE_NAME, "readonly");
+        var req = tx.objectStore(IDB_STORE_NAME).get(IDB_HANDLE_KEY);
+        req.onsuccess = function(){ resolve(req.result || null); };
+        req.onerror = function(){ reject(req.error); };
+      });
+    }catch(e){ return null; }
+  }
+
+  async function ensureHandlePermission(handle, requestIfNeeded){
+    var opts = { mode: "readwrite" };
+    if((await handle.queryPermission(opts)) === "granted") return true;
+    if(requestIfNeeded && (await handle.requestPermission(opts)) === "granted") return true;
+    return false;
+  }
 
   function setFileStatus(text, linked){
     document.getElementById("fileStatusText").textContent = text;
@@ -1553,6 +1603,40 @@
     return saveQueue;
   }
 
+  async function writeToLinkedFile(wbout){
+    if(!xlsxFileHandle){
+      xlsxFileHandle = await idbGetHandle();
+    }
+    if(xlsxFileHandle && !(await ensureHandlePermission(xlsxFileHandle, true))){
+      xlsxFileHandle = null;
+    }
+    if(!xlsxFileHandle){
+      xlsxFileHandle = await window.showSaveFilePicker({
+        suggestedName: xlsxFileName || "exp.xlsx",
+        types: [{ description: "Excel", accept: { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"] } }]
+      });
+      await idbSetHandle(xlsxFileHandle);
+    }
+    var writable = await xlsxFileHandle.createWritable();
+    await writable.write(wbout);
+    await writable.close();
+    xlsxFileName = xlsxFileHandle.name;
+    setFileStatus("מחובר לקובץ: " + xlsxFileHandle.name, true);
+  }
+
+  function downloadAsNewFile(wbout){
+    var blob = new Blob([wbout], {type:"application/octet-stream"});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = xlsxFileName || "exp.xlsx";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    setFileStatus("הקובץ הורד (" + (xlsxFileName || "exp.xlsx") + ") — החליפו איתו את הקובץ המקורי", false);
+  }
+
   async function doSaveToExcel(){
     try{
       if(!xlsxWorkbook){
@@ -1562,19 +1646,15 @@
       writeStateIntoWorkbook();
       var wbout = XLSX.write(xlsxWorkbook, {bookType:"xlsx", type:"array"});
 
-      var blob = new Blob([wbout], {type:"application/octet-stream"});
-      var url = URL.createObjectURL(blob);
-      var a = document.createElement("a");
-      a.href = url;
-      a.download = xlsxFileName || "exp.xlsx";
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      setFileStatus("הקובץ הורד (" + (xlsxFileName || "exp.xlsx") + ") — החליפו איתו את הקובץ המקורי", false);
+      if(SUPPORTS_FSA){
+        await writeToLinkedFile(wbout);
+      } else {
+        downloadAsNewFile(wbout);
+      }
       setDirty(false);
       setSaveFeedback("saved");
     }catch(err){
+      if(err && err.name === "AbortError") return;
       setSaveFeedback("error");
       alert("שמירה לאקסל נכשלה: " + (err && err.message ? err.message : err));
     }
@@ -1966,6 +2046,29 @@
   document.getElementById("btnSaveExcel").addEventListener("click", function(){
     saveToExcel();
   });
+
+  var btnOpenExcelFile = document.getElementById("btnOpenExcelFile");
+  if(SUPPORTS_FSA){
+    btnOpenExcelFile.hidden = false;
+    btnOpenExcelFile.addEventListener("click", async function(){
+      try{
+        var handle = await window.showOpenFilePicker({
+          types: [{ description: "Excel", accept: { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"] } }]
+        });
+        handle = handle[0];
+        if(!(await ensureHandlePermission(handle, true))) return;
+        var file = await handle.getFile();
+        var buf = await file.arrayBuffer();
+        var wb = XLSX.read(buf, {type:"array"});
+        xlsxFileHandle = handle;
+        await idbSetHandle(handle);
+        importWorkbookIntoState(wb, handle.name);
+      }catch(err){
+        if(err && err.name === "AbortError") return;
+        alert("פתיחת קובץ נכשלה: " + (err && err.message ? err.message : err));
+      }
+    });
+  }
 
   /* ---------- add-expense dialog ---------- */
   var addExpenseOverlay = document.getElementById("addExpenseOverlay");
@@ -3053,13 +3156,28 @@
       var buf = await res.arrayBuffer();
       var wb = XLSX.read(buf, {type:"array"});
       importWorkbookIntoState(wb, "exp.xlsx");
-      setFileStatus("נטען מהענן (exp.xlsx) — שינויים יישמרו כהורדה לקובץ חדש", false);
+      setFileStatus(SUPPORTS_FSA
+        ? "נטען מהענן (exp.xlsx) — לחצו \"פתח קובץ\" כדי לחבר קובץ מקומי לשמירה ישירה"
+        : "נטען מהענן (exp.xlsx) — שינויים יישמרו כהורדה לקובץ חדש", false);
     }catch(e){
       // no bundled file reachable (e.g. local file:// page, or none uploaded yet) — keep blank state
     }
   }
 
+  /* If a file was linked in a previous session, reconnect the handle so the
+     next save overwrites it directly instead of prompting for a new file. */
+  async function restoreLinkedFileHandle(){
+    if(!SUPPORTS_FSA) return;
+    var handle = await idbGetHandle();
+    if(!handle) return;
+    if(!(await ensureHandlePermission(handle, false))) return;
+    xlsxFileHandle = handle;
+    xlsxFileName = handle.name;
+    setFileStatus("מחובר לקובץ: " + handle.name, true);
+  }
+
   initCloudFallback();
+  restoreLinkedFileHandle();
 })();
 </script>
 </body>
