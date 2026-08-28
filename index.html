@@ -1002,10 +1002,8 @@
         </div>
         <button class="primary" id="btnAddExpense" type="button">+ הוסף הוצאה</button>
         <button class="ghost" id="btnManageCategories" type="button">ניהול קטגוריות</button>
-        <button class="ghost" id="btnOpenExcel" type="button">פתח מ-Excel</button>
         <button class="ghost" id="btnSaveExcel" type="button">שמור ל-Excel</button>
         <button class="ghost" id="btnReset" type="button">איפוס נתונים</button>
-        <input type="file" id="hiddenFileInput" accept=".xlsx" style="display:none">
       </div>
     </div>
     <div class="file-status" id="fileStatus"><span class="fdot"></span><span id="fileStatusText">לא נטען קובץ — הנתונים מוצגים מהעריכה האחרונה בדפדפן</span><span class="unsaved-badge" id="unsavedBadge"><span class="wdot"></span><span id="unsavedBadgeText">שינויים לא שמורים</span></span></div>
@@ -1286,78 +1284,9 @@
 
   var xlsxWorkbook = null;   // parsed SheetJS workbook, once a file has been opened
   var xlsxSheetName = null;
-  var xlsxFileHandle = null; // FileSystemFileHandle, when the browser supports it
   var xlsxFileName = null;
 
   var CONFIG_SHEET_NAME = "__budget_config";
-
-  /* Persists the FileSystemFileHandle across reloads so the same file can be
-     re-read and written back to, instead of falling back to a download.
-     FileSystemFileHandle is structured-cloneable, so IndexedDB can store it
-     (localStorage cannot). This is only a pointer to the file — the actual
-     data/preferences live inside the file itself so they survive a browser
-     cache clear; only this pointer is lost, requiring one re-pick. */
-  var IDB_DB_NAME = "budgetDashboardDB";
-  var IDB_STORE_NAME = "handles";
-  var IDB_HANDLE_KEY = "xlsxFileHandle";
-
-  function idbOpen(){
-    return new Promise(function(resolve, reject){
-      if(!window.indexedDB){ reject(new Error("indexedDB not available")); return; }
-      var req = indexedDB.open(IDB_DB_NAME, 1);
-      req.onupgradeneeded = function(){ req.result.createObjectStore(IDB_STORE_NAME); };
-      req.onsuccess = function(){ resolve(req.result); };
-      req.onerror = function(){ reject(req.error); };
-    });
-  }
-
-  function idbSetHandle(handle){
-    return idbOpen().then(function(db){
-      return new Promise(function(resolve, reject){
-        var tx = db.transaction(IDB_STORE_NAME, "readwrite");
-        tx.objectStore(IDB_STORE_NAME).put(handle, IDB_HANDLE_KEY);
-        tx.oncomplete = function(){ resolve(); };
-        tx.onerror = function(){ reject(tx.error); };
-      });
-    }).catch(function(){});
-  }
-
-  function idbGetHandle(){
-    return idbOpen().then(function(db){
-      return new Promise(function(resolve, reject){
-        var tx = db.transaction(IDB_STORE_NAME, "readonly");
-        var req = tx.objectStore(IDB_STORE_NAME).get(IDB_HANDLE_KEY);
-        req.onsuccess = function(){ resolve(req.result || null); };
-        req.onerror = function(){ reject(req.error); };
-      });
-    }).catch(function(){ return null; });
-  }
-
-  function idbClearHandle(){
-    return idbOpen().then(function(db){
-      return new Promise(function(resolve){
-        var tx = db.transaction(IDB_STORE_NAME, "readwrite");
-        tx.objectStore(IDB_STORE_NAME).delete(IDB_HANDLE_KEY);
-        tx.oncomplete = function(){ resolve(); };
-        tx.onerror = function(){ resolve(); };
-      });
-    }).catch(function(){});
-  }
-
-  var autoSaveTimer = null;
-  function scheduleAutoSave(){
-    // The edit that got us here is a real user gesture — spend it now to
-    // silently reconnect the linked file (if reconnect is pending) so the
-    // debounced save below actually lands in that file instead of falling
-    // back to "download a new file".
-    if(typeof pendingReconnectHandle !== "undefined" && pendingReconnectHandle){ reconnectPendingHandle(); }
-    if(!xlsxFileHandle) return;
-    if(autoSaveTimer) clearTimeout(autoSaveTimer);
-    autoSaveTimer = setTimeout(function(){
-      autoSaveTimer = null;
-      saveToExcel();
-    }, 800);
-  }
 
   function setFileStatus(text, linked){
     document.getElementById("fileStatusText").textContent = text;
@@ -1619,38 +1548,8 @@
     writeConfigSheetIntoWorkbook(xlsxWorkbook);
   }
 
-  async function openFromExcel(){
-    try{
-      if(window.showOpenFilePicker){
-        var handles = await window.showOpenFilePicker({
-          types:[{ description:"Excel", accept:{ "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":[".xlsx"] } }],
-          excludeAcceptAllOption:false,
-          multiple:false
-        });
-        xlsxFileHandle = handles[0];
-        idbSetHandle(xlsxFileHandle);
-        var file = await xlsxFileHandle.getFile();
-        var buf = await file.arrayBuffer();
-        var wb = XLSX.read(buf, {type:"array"});
-        importWorkbookIntoState(wb, file.name);
-      } else {
-        var input = document.getElementById("hiddenFileInput");
-        xlsxFileHandle = null;
-        input.value = "";
-        input.click();
-      }
-    }catch(err){
-      if(err && err.name === "AbortError") return;
-      alert("לא ניתן היה לפתוח את הקובץ: " + (err && err.message ? err.message : err));
-    }
-  }
-
   var saveQueue = Promise.resolve();
   function saveToExcel(){
-    // Serialize: the File System Access API throws ("state had changed since
-    // it was read from disk") if a second createWritable()/write()/close()
-    // is opened on the same handle before the first one finished. Manual
-    // Save clicks and the debounced auto-save can otherwise race.
     saveQueue = saveQueue.then(doSaveToExcel, doSaveToExcel);
     return saveQueue;
   }
@@ -1664,35 +1563,18 @@
       writeStateIntoWorkbook();
       var wbout = XLSX.write(xlsxWorkbook, {bookType:"xlsx", type:"array"});
 
-      if(xlsxFileHandle){
-        setSaveFeedback("saving");
-        if(xlsxFileHandle.queryPermission){
-          var perm = await xlsxFileHandle.queryPermission({mode:"readwrite"});
-          if(perm !== "granted"){
-            perm = await xlsxFileHandle.requestPermission({mode:"readwrite"});
-            if(perm !== "granted") throw new Error("אין הרשאת כתיבה לקובץ");
-          }
-        }
-        var writable = await xlsxFileHandle.createWritable();
-        await writable.write(wbout);
-        await writable.close();
-        setFileStatus("נשמר בהצלחה לקובץ: " + (xlsxFileName || "exp.xlsx") + " · " + new Date().toLocaleTimeString("he-IL"), true);
-        setDirty(false);
-        setSaveFeedback("saved");
-      } else {
-        var blob = new Blob([wbout], {type:"application/octet-stream"});
-        var url = URL.createObjectURL(blob);
-        var a = document.createElement("a");
-        a.href = url;
-        a.download = xlsxFileName || "exp.xlsx";
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        setFileStatus("הקובץ הורד (" + (xlsxFileName || "exp.xlsx") + ") — החליפו איתו את הקובץ המקורי", false);
-        setDirty(false);
-        setSaveFeedback("saved");
-      }
+      var blob = new Blob([wbout], {type:"application/octet-stream"});
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = xlsxFileName || "exp.xlsx";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setFileStatus("הקובץ הורד (" + (xlsxFileName || "exp.xlsx") + ") — החליפו איתו את הקובץ המקורי", false);
+      setDirty(false);
+      setSaveFeedback("saved");
     }catch(err){
       setSaveFeedback("error");
       alert("שמירה לאקסל נכשלה: " + (err && err.message ? err.message : err));
@@ -2079,15 +1961,13 @@
       saveState();
       refreshComputed();
       setDirty(true);
-      scheduleAutoSave();
     });
   });
 
   document.getElementById("btnReset").addEventListener("click", function(){
     if(!confirm("לאפס את כל הנתונים שהוזנו?")) return;
     state = { income: blankSection(INCOME_CATS), expenses: blankSection(EXPENSE_CATS) };
-    xlsxWorkbook = null; xlsxSheetName = null; xlsxFileHandle = null; xlsxFileName = null;
-    idbClearHandle();
+    xlsxWorkbook = null; xlsxSheetName = null; xlsxFileName = null;
     saveState();
     buildLedger(incomeTable, "income", INCOME_CATS);
     buildExpenseLedger();
@@ -2097,29 +1977,8 @@
     setDirty(false);
   });
 
-  document.getElementById("btnOpenExcel").addEventListener("click", openFromExcel);
-  document.getElementById("btnSaveExcel").addEventListener("click", async function(){
-    // This click is itself a valid user gesture — use it to reconnect the
-    // linked file first (if reconnect is pending) so this very save writes
-    // to that file instead of falling back to "download a new file".
-    if(typeof pendingReconnectHandle !== "undefined" && pendingReconnectHandle){
-      await reconnectPendingHandle();
-    }
+  document.getElementById("btnSaveExcel").addEventListener("click", function(){
     saveToExcel();
-  });
-  document.getElementById("hiddenFileInput").addEventListener("change", function(ev){
-    var file = ev.target.files && ev.target.files[0];
-    if(!file) return;
-    var reader = new FileReader();
-    reader.onload = function(){
-      try{
-        var wb = XLSX.read(reader.result, {type:"array"});
-        importWorkbookIntoState(wb, file.name);
-      }catch(err){
-        alert("קריאת הקובץ נכשלה: " + (err && err.message ? err.message : err));
-      }
-    };
-    reader.readAsArrayBuffer(file);
   });
 
   /* ---------- add-expense dialog ---------- */
@@ -2349,7 +2208,6 @@
     saveState();
     updateToggleAllButtonLabel();
     syncPeriodControls();
-    scheduleAutoSave();
   }
 
   document.getElementById("btnPeriod").addEventListener("click", function(ev){
@@ -2452,7 +2310,6 @@
     renderChart();
     if(!skipSave){
       try{ localStorage.setItem(THEME_KEY, JSON.stringify({ income: income, expense: expense })); }catch(e){}
-      scheduleAutoSave();
     }
   }
 
@@ -2466,7 +2323,6 @@
     themeExpenseInput.value = c.expense;
     renderThemeSwatches();
     renderChart();
-    scheduleAutoSave();
   }
 
   function renderThemeSwatches(){
@@ -2521,7 +2377,6 @@
     renderChart();
     if(!skipSave){
       try{ localStorage.setItem(BG_KEY, bg); }catch(e){}
-      scheduleAutoSave();
     }
   }
 
@@ -2533,7 +2388,6 @@
     themeBgInput.value = currentBg();
     renderBgSwatches();
     renderChart();
-    scheduleAutoSave();
   }
 
   function renderBgSwatches(){
@@ -2610,7 +2464,6 @@
     var val = titleInputEl.value.trim() || DEFAULT_TITLE;
     setPageTitle(val);
     try{ localStorage.setItem(TITLE_KEY, val); }catch(e){}
-    scheduleAutoSave();
     titleInputEl.hidden = true;
     pageTitleEl.hidden = false;
   }
@@ -2701,7 +2554,6 @@
     updateToggleAllButtonLabel();
     refreshComputed();
     setDirty(true);
-    scheduleAutoSave();
     closeAddExpenseDialog();
   });
 
@@ -2736,7 +2588,6 @@
     refreshComputed();
     saveState();
     setDirty(true);
-    scheduleAutoSave();
   }
 
   function populateManageNewCatParentSelect(){
@@ -2841,7 +2692,6 @@
       saveState();
       refreshComputed();
       setDirty(true);
-      scheduleAutoSave();
       renderManagePanel();
     }
   });
@@ -3202,76 +3052,15 @@
   loadBackground();
   refreshComputed();
 
-  /* ---------- reconnect to the linked file on load ---------- */
-  var pendingReconnectHandle = null;
-  var fileStatusEl = document.getElementById("fileStatus");
-
-  async function tryLoadFromHandle(handle){
-    var file = await handle.getFile();
-    var buf = await file.arrayBuffer();
-    var wb = XLSX.read(buf, {type:"array"});
-    xlsxFileHandle = handle;
-    importWorkbookIntoState(wb, file.name);
-  }
-
-  async function reconnectPendingHandle(){
-    // requestPermission() requires a real user gesture. Rather than forcing
-    // the user to find and click the small reconnect hint, the Save button
-    // click and every edit that schedules an auto-save spend their own
-    // gesture on this first, so reconnecting is effectively automatic.
-    if(!pendingReconnectHandle) return;
-    var handle = pendingReconnectHandle;
-    pendingReconnectHandle = null;
-    try{
-      var perm = await handle.requestPermission({mode:"readwrite"});
-      if(perm !== "granted"){ pendingReconnectHandle = handle; return; }
-      fileStatusEl.style.cursor = "";
-      if(isDirty){
-        // an edit already landed before this resolved — importing now would
-        // overwrite it, so just link the handle; the next save writes the
-        // current (edited) state into the file.
-        xlsxFileHandle = handle;
-        setFileStatus("מחובר לקובץ: " + handle.name, true);
-      } else {
-        await tryLoadFromHandle(handle);
-      }
-    }catch(err){
-      pendingReconnectHandle = handle;
-    }
-  }
-
-  async function initFileLink(){
-    var handle = null;
-    try{ handle = await idbGetHandle(); }catch(e){ handle = null; }
-    if(!handle) return;
-    try{
-      var perm = handle.queryPermission ? await handle.queryPermission({mode:"readwrite"}) : "granted";
-      if(perm === "granted"){
-        await tryLoadFromHandle(handle);
-      } else {
-        pendingReconnectHandle = handle;
-        setFileStatus("מחובר לקובץ: " + handle.name + " — יחובר אוטומטית בפעולה הבאה, או לחצו כאן", false);
-        fileStatusEl.style.cursor = "pointer";
-      }
-    }catch(e){
-      // handle is stale/revoked (e.g. file moved/deleted) — stay unlinked, keep local data
-    }
-  }
-
-  fileStatusEl.addEventListener("click", function(){
-    reconnectPendingHandle();
-  });
-
   /* ---------- cloud fallback: pull exp.xlsx bundled next to this page ----------
      Only runs on a browser/device with no saved data yet (nothing in
-     localStorage) and no linked local file handle, so it never overwrites a
-     device that already has its own edits — it just seeds first-time visits
-     (e.g. opening the GitHub Pages site on a new device) with the copy of
-     exp.xlsx committed to the repo. */
+     localStorage), so it never overwrites a device that already has its own
+     edits — it just seeds first-time visits (e.g. opening the GitHub Pages
+     site on a new device) with the copy of exp.xlsx committed to the repo. */
   async function initCloudFallback(){
     var hasLocalData = false;
     try{ hasLocalData = !!(localStorage.getItem(STORE_KEY) || localStorage.getItem(STORE_KEY_V1)); }catch(e){}
-    if(hasLocalData || xlsxFileHandle) return;
+    if(hasLocalData) return;
     try{
       var res = await fetch("exp.xlsx");
       if(!res.ok) return;
@@ -3284,7 +3073,7 @@
     }
   }
 
-  initFileLink().then(initCloudFallback);
+  initCloudFallback();
 })();
 </script>
 </body>
