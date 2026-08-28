@@ -1003,7 +1003,6 @@
         <button class="primary" id="btnAddExpense" type="button">+ הוסף הוצאה</button>
         <button class="ghost" id="btnManageCategories" type="button">ניהול קטגוריות</button>
         <button class="ghost" id="btnSaveExcel" type="button">שמור ל-Excel</button>
-        <button class="ghost" id="btnReset" type="button">איפוס נתונים</button>
       </div>
     </div>
     <div class="file-status" id="fileStatus"><span class="fdot"></span><span id="fileStatusText">לא נטען קובץ — הנתונים מוצגים מהעריכה האחרונה בדפדפן</span><span class="unsaved-badge" id="unsavedBadge"><span class="wdot"></span><span id="unsavedBadgeText">שינויים לא שמורים</span></span></div>
@@ -1962,19 +1961,6 @@
       refreshComputed();
       setDirty(true);
     });
-  });
-
-  document.getElementById("btnReset").addEventListener("click", function(){
-    if(!confirm("לאפס את כל הנתונים שהוזנו?")) return;
-    state = { income: blankSection(INCOME_CATS), expenses: blankSection(EXPENSE_CATS) };
-    xlsxWorkbook = null; xlsxSheetName = null; xlsxFileName = null;
-    saveState();
-    buildLedger(incomeTable, "income", INCOME_CATS);
-    buildExpenseLedger();
-    updateToggleAllButtonLabel();
-    refreshComputed();
-    setFileStatus("לא נטען קובץ — הנתונים מוצגים מהעריכה האחרונה בדפדפן", false);
-    setDirty(false);
   });
 
   document.getElementById("btnSaveExcel").addEventListener("click", function(){
